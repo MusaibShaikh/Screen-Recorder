@@ -22,7 +22,75 @@ except ImportError:
 
 SYSTEM_AUDIO_DELAY_MS = 240
 
+def get_wasapi_loopback_device():
+    """Get the default WASAPI loopback device (what's playing on speakers)."""
+    try:
+        if not WASAPI_AVAILABLE:
+            return None
+        
+        p = pyaudio.PyAudio()
+        
+        # Try to get the default WASAPI loopback device
+        try:
+            wasapi_info = p.get_default_wasapi_loopback()
+            print(f"[SUCCESS] Found WASAPI loopback device: {wasapi_info['name']}")
+            p.terminate()
+            return wasapi_info
+        except Exception as e:
+            print(f"[ERROR] Could not get WASAPI loopback device: {e}")
+            
+            # Fallback: list all devices and find loopback
+            print("[DEBUG] Searching for loopback devices manually...")
+            for i in range(p.get_device_count()):
+                dev_info = p.get_device_info_by_index(i)
+                if dev_info.get('isLoopback', False) or 'loopback' in dev_info.get('name', '').lower():
+                    print(f"[SUCCESS] Found loopback device: {dev_info['name']}")
+                    p.terminate()
+                    return dev_info
+            
+            p.terminate()
+            return None
+            
+    except Exception as e:
+        print(f"[ERROR] WASAPI detection failed: {e}")
+        return None
+
 class FFmpegProcessManager:
+    def __init__(self):
+        self.processes = []
+        atexit.register(self.cleanup_all)
+    
+    def start_process(self, cmd, description=""):
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+            )
+            self.processes.append({'process': process, 'description': description})
+            return process
+        except Exception:
+            return None
+    
+    def stop_process(self, process):
+        if process and process.poll() is None:
+            try:
+                process.stdin.write(b"q")
+                process.stdin.flush()
+                process.wait(timeout=3)
+            except:
+                try:
+                    process.terminate()
+                except:
+                    pass
+            finally:
+                self.processes = [p for p in self.processes if p['process'] != process]
+    
+    def cleanup_all(self):
+        for item in self.processes[:]:
+            self.stop_process(item['process'])
     def __init__(self):
         self.processes = []
         atexit.register(self.cleanup_all)
@@ -98,22 +166,16 @@ class AudioRecorder:
         try:
             if not WASAPI_AVAILABLE or pyaudio is None:
                 print("[ERROR] pyaudiowpatch not available - cannot capture system audio")
+                print("[INSTALL] Run: pip install pyaudiowpatch")
                 return
             
-            device_info = None
-            p = pyaudio.PyAudio()
-            
-            for i in range(p.get_device_count()):
-                dev_info = p.get_device_info_by_index(i)
-                if dev_info.get('isLoopback', False) or 'loopback' in dev_info.get('name', '').lower():
-                    device_info = dev_info
-                    break
+            device_info = get_wasapi_loopback_device()
             
             if not device_info:
-                print("[ERROR] No loopback device found")
-                p.terminate()
+                print("[ERROR] No WASAPI loopback device found")
                 return
             
+            p = pyaudio.PyAudio()
             print(f"[SYSTEM AUDIO] Using device: {device_info['name']}")
             print(f"[SYSTEM AUDIO] Sample rate: {device_info['defaultSampleRate']}")
             
@@ -130,6 +192,7 @@ class AudioRecorder:
                     audio_data = []
                     
                     try:
+                        # Open WASAPI loopback stream
                         stream = p.open(
                             format=pyaudio.paInt16,
                             channels=channels,
@@ -141,6 +204,7 @@ class AudioRecorder:
                         
                         print(f"[SYSTEM AUDIO] Stream opened, recording...")
                         
+                        # Capture audio while not paused
                         while not self.is_paused and self.is_recording:
                             try:
                                 data = stream.read(chunk_size, exception_on_overflow=False)
@@ -154,6 +218,7 @@ class AudioRecorder:
                         
                         print(f"[SYSTEM AUDIO] Stopped segment {segment_idx}, chunks: {len(audio_data)}")
                         
+                        # Save captured audio to WAV file
                         if audio_data:
                             with wave.open(output_file, 'wb') as wf:
                                 wf.setnchannels(channels)
@@ -173,6 +238,8 @@ class AudioRecorder:
                             
                     except Exception as e:
                         print(f"[SYSTEM AUDIO] Stream error: {e}")
+                        import traceback
+                        traceback.print_exc()
                 
                 time.sleep(0.05)
             
@@ -181,6 +248,8 @@ class AudioRecorder:
             
         except Exception as e:
             print(f"[SYSTEM AUDIO] Fatal error: {e}")
+            import traceback
+            traceback.print_exc()
             
     def _record_mic_audio(self):
         """Record microphone audio using sounddevice."""
@@ -254,14 +323,22 @@ class AudioRecorder:
             system_combined = None
             mic_combined = None
             
+            # Reduce system audio volume by 30% when both are present (to match mic level)
+            # This compensates for Windows amplifying system audio relative to mic
+            system_volume_reduction = 0.7  # 70% of original volume
+            
             if self.system_segments:
                 for segment in self.system_segments:
                     if os.path.exists(segment) and os.path.getsize(segment) > 0:
                         audio = AudioSegment.from_wav(segment)
                         audio = AudioSegment.silent(duration=SYSTEM_AUDIO_DELAY_MS) + audio
-                        if sys_volume != 1.0:
-                            gain = 20 * np.log10(max(sys_volume, 0.01))
+                        
+                        # Apply both user's volume slider AND the system reduction
+                        combined_sys_vol = sys_volume * system_volume_reduction
+                        if combined_sys_vol != 1.0:
+                            gain = 20 * np.log10(max(combined_sys_vol, 0.01))
                             audio = audio.apply_gain(gain)
+                        
                         system_combined = audio if system_combined is None else system_combined + audio
 
             if self.mic_segments:
@@ -276,24 +353,31 @@ class AudioRecorder:
             final_audio = None
             
             if system_combined and mic_combined:
-                sys_samples = np.array(system_combined.get_array_of_samples()).astype(np.float32)
-                mic_samples = np.array(mic_combined.get_array_of_samples()).astype(np.float32)
-                max_samples = max(len(sys_samples), len(mic_samples))
-                sys_samples = np.pad(sys_samples, (0, max_samples - len(sys_samples)), 'constant')
-                mic_samples = np.pad(mic_samples, (0, max_samples - len(mic_samples)), 'constant')
-                
-                mixed_samples = sys_samples + mic_samples
-                
-                max_val = np.abs(mixed_samples).max()
-                if max_val > 32767:
-                    mixed_samples = mixed_samples * (32767 / max_val)
-                
-                final_audio = AudioSegment(
-                    mixed_samples.astype(np.int16).tobytes(),
-                    frame_rate=system_combined.frame_rate,
-                    sample_width=system_combined.sample_width,
-                    channels=system_combined.channels
-                )
+                # Ensure both tracks share the same frame rate, channels and sample width
+                target_rate = self.sample_rate
+                system_combined = system_combined.set_frame_rate(target_rate).set_channels(2).set_sample_width(2)
+                mic_combined = mic_combined.set_frame_rate(target_rate).set_channels(2).set_sample_width(2)
+
+                # Use pydub overlay which handles mixing and alignment reliably
+                try:
+                    final_audio = system_combined.overlay(mic_combined)
+                except Exception:
+                    # Fallback: if overlay fails, fall back to numpy mixing (safer than crashing)
+                    sys_samples = np.array(system_combined.get_array_of_samples()).astype(np.float32)
+                    mic_samples = np.array(mic_combined.get_array_of_samples()).astype(np.float32)
+                    max_samples = max(len(sys_samples), len(mic_samples))
+                    sys_samples = np.pad(sys_samples, (0, max_samples - len(sys_samples)), 'constant')
+                    mic_samples = np.pad(mic_samples, (0, max_samples - len(mic_samples)), 'constant')
+                    mixed_samples = sys_samples + mic_samples
+                    max_val = np.abs(mixed_samples).max()
+                    if max_val > 32767:
+                        mixed_samples = mixed_samples * (32767 / max_val)
+                    final_audio = AudioSegment(
+                        mixed_samples.astype(np.int16).tobytes(),
+                        frame_rate=target_rate,
+                        sample_width=2,
+                        channels=2
+                    )
                 
             elif system_combined:
                 final_audio = system_combined
